@@ -1,7 +1,12 @@
 import os
 import urllib.parse
 
-import gunicorn.http.errors
+try:
+    import gunicorn.http.errors
+    GUNICORN_AVAILABLE = True
+except ImportError:
+    GUNICORN_AVAILABLE = False
+
 import sentry_sdk
 
 from flask import Flask, Response, abort, redirect, render_template, request, url_for
@@ -42,9 +47,10 @@ app.jinja_env.trim_blocks = True
 app.jinja_env.lstrip_blocks = True
 
 
-@app.errorhandler(gunicorn.http.errors.ParseException)
-def handle_bad_request(e):
-    return abort(400)
+if GUNICORN_AVAILABLE:
+    @app.errorhandler(gunicorn.http.errors.ParseException)
+    def handle_bad_request(e):
+        return abort(400)
 
 
 @app.route("/")
@@ -162,9 +168,11 @@ def distribution(project_name, version, first, second, rest, distname):
         file_urls = [
             "./" + urllib.parse.quote(filename) for filename in dist.namelist()
         ]
+        download_url = f"/project/{project_name}/{version}/packages/{first}/{second}/{rest}/{distname}/download"
         return render_template(
             "links.html",
             links=file_urls,
+            download_url=download_url,
             h2=f"{project_name}",
             h2_link=f"/project/{project_name}",
             h2_paren=h2_paren,
@@ -221,11 +229,13 @@ def file(project_name, version, first, second, rest, distname, filepath):
             return abort(400)
         file_extension = filepath.split(".")[-1]
         report_link = pypi_report_form(project_name, version, filepath, request.url)
+        download_url = f"/project/{project_name}/{version}/packages/{first}/{second}/{rest}/{distname}/{filepath}/download"
 
         details = [detail.html() for detail in basic_details(dist, filepath)]
         common_params = {
             "file_details": details,
             "mailto_report_link": report_link,
+            "download_url": download_url,
             "h2": f"{project_name}",
             "h2_link": f"/project/{project_name}",
             "h2_paren": h2_paren,
@@ -271,3 +281,99 @@ def health():
 @app.route("/robots.txt")
 def robots():
     return Response("User-agent: *\nDisallow: /", mimetype="text/plain")
+
+
+@app.route(
+    "/project/<project_name>/<version>/packages/<first>/<second>/<rest>/<distname>/download"
+)
+def download_distribution(project_name, version, first, second, rest, distname):
+    """Download entire distribution package."""
+    if project_name != canonicalize_name(project_name):
+        return redirect(
+            url_for(
+                "download_distribution",
+                project_name=canonicalize_name(project_name),
+                version=version,
+                first=first,
+                second=second,
+                rest=rest,
+                distname=distname,
+            ),
+            301,
+        )
+
+    try:
+        dist = _get_dist(first, second, rest, distname)
+    except InspectorError:
+        return abort(400)
+
+    if not dist:
+        return abort(404)
+
+    # Get the raw distribution file from PyPI
+    url = f"https://files.pythonhosted.org/packages/{first}/{second}/{rest}/{distname}"
+    try:
+        resp = requests_session().get(url, stream=True)
+        resp.raise_for_status()
+    except Exception:
+        return abort(404)
+
+    # Return the file with proper headers to trigger download
+    return Response(
+        resp.content,
+        mimetype="application/octet-stream",
+        headers={
+            "Content-Disposition": f"attachment; filename={distname}",
+            "Content-Length": str(len(resp.content)),
+        },
+    )
+
+
+@app.route(
+    "/project/<project_name>/<version>/packages/<first>/<second>/<rest>/<distname>/<path:filepath>/download"
+)
+def download_file(project_name, version, first, second, rest, distname, filepath):
+    """Download individual file from a distribution."""
+    if project_name != canonicalize_name(project_name):
+        return redirect(
+            url_for(
+                "download_file",
+                project_name=canonicalize_name(project_name),
+                version=version,
+                first=first,
+                second=second,
+                rest=rest,
+                distname=distname,
+                filepath=filepath,
+            ),
+            301,
+        )
+
+    try:
+        dist = _get_dist(first, second, rest, distname)
+    except InspectorError:
+        return abort(400)
+
+    if not dist:
+        return abort(404)
+
+    try:
+        contents = dist.contents(filepath)
+    except FileNotFoundError:
+        return abort(404)
+    except InspectorError:
+        return abort(400)
+
+    # Extract just the filename from the path
+    filename = filepath.split("/")[-1]
+
+    # Return the file with proper headers to trigger download
+    return Response(
+        contents,
+        mimetype="application/octet-stream",
+        headers={
+            "Content-Disposition": f"attachment; filename={filename}",
+            "Content-Length": str(len(contents)),
+        },
+    )
+
